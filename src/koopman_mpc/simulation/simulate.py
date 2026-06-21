@@ -34,10 +34,15 @@ class KoopmanControllerAdapter:
     This adapter converts SCPResult to a plain dict.
     """
 
-    def __init__(self, predictor, config: Optional[KoopmanMPCConfig] = None):
+    def __init__(
+        self,
+        predictor,
+        config: Optional[KoopmanMPCConfig] = None,
+        w_bounds: Optional[np.ndarray] = None,
+    ):
         if config is None:
             config = KoopmanMPCConfig()
-        self._ctrl = KoopmanController(predictor, config)
+        self._ctrl = KoopmanController(predictor, config, W_bounds=w_bounds)
 
     def compute_control(
         self,
@@ -96,7 +101,7 @@ def run_koopman_mpc(
         prediction_horizon=predictor.horizon,
         beta_0=beta_0,
     )
-    ctrl = KoopmanControllerAdapter(predictor, config)
+    ctrl = KoopmanControllerAdapter(predictor, config, w_bounds=w_bounds)
     patient = generate_demo_patient(n_state_y=n_state_y, seed=seed)
     runner = SimulationRunner(patient, dt=dt, beta_0=beta_0)
 
