@@ -229,7 +229,7 @@ def load_csv_training_data(
     seed: int = 42,
     dt: float = 0.02,
 ) -> Tuple[Tuple, Tuple, str]:
-    """Load Mark/4YP-style beta_causal_RMS.csv + stimulation.csv folders."""
+    """Load processed beta_causal_RMS.csv + stimulation.csv folders."""
     dirs = _patient_dirs(data_dir, patient_role=patient_role)
     if not dirs:
         raise FileNotFoundError(
