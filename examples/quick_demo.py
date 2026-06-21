@@ -18,6 +18,7 @@ from koopman_mpc.simulation.simulate import run_koopman_mpc
 
 
 def main() -> None:
+    """Train a small Koopman model and run a short closed-loop demo."""
     print("Generating synthetic training data ...")
     (x_tr, u_tr, y_tr), (x_te, u_te, y_te), _ = load_training_data(
         horizon=5,

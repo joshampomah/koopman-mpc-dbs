@@ -19,6 +19,7 @@ from koopman_mpc.simulation.simulate import run_koopman_mpc
 
 
 def main() -> None:
+    """Load a trained Koopman model and run a closed-loop simulation."""
     p = argparse.ArgumentParser(description="Run Koopman MPC on synthetic data")
     p.add_argument("--model", required=True, help="Path to trained model directory")
     p.add_argument("--duration", type=float, default=60.0, help="Simulation duration (s)")

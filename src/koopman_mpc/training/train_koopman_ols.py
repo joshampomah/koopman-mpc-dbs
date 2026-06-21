@@ -308,6 +308,7 @@ def save_model(
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Train and save one or more Koopman/ARX models from CLI arguments."""
     parser = argparse.ArgumentParser(description="Train Koopman/ARX model by OLS")
     parser.add_argument(
         "--model", choices=["lasso46", "arx", "both"], default="both",
