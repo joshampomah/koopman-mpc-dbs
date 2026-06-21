@@ -1,4 +1,6 @@
 """Tests for OLS training pipeline."""
+import json
+
 import numpy as np
 import pytest
 
@@ -20,10 +22,53 @@ def test_prepare_multistep_sequences():
     beta = rng.standard_normal(T).astype(np.float32)
     stim = rng.random(T).astype(np.float32) * 0.03
     seqs = prepare_multistep_sequences(beta, stim, n_state_y=15, n_state_u=15, horizon=7)
-    n_expected = T - 30 - 7 + 1
+    n_expected = T - 15 - 7
     assert seqs["x"].shape == (n_expected, 30)
     assert seqs["u"].shape == (n_expected, 7)
     assert seqs["y"].shape == (n_expected, 7)
+
+
+def _write_patient_folder(root, name, beta, stim):
+    patient_dir = root / name
+    patient_dir.mkdir(parents=True)
+    np.savetxt(patient_dir / "beta_causal_RMS.csv", beta, delimiter=",")
+    np.savetxt(patient_dir / "stimulation.csv", stim, delimiter=",")
+    return patient_dir
+
+
+def test_load_csv_training_data_with_selected_patients(tmp_path):
+    """CSV loader accepts 4YP-style selected patient roots."""
+    from koopman_mpc.training.train_koopman_ols import load_csv_training_data
+
+    beta = np.linspace(1.0, 2.0, 80, dtype=np.float32)
+    stim = np.linspace(0.0, 0.03, 80, dtype=np.float32)
+    _write_patient_folder(tmp_path, "patient_training", beta, np.repeat(stim, 4))
+    _write_patient_folder(tmp_path, "patient_refinement", beta, stim)
+    (tmp_path / "selected_patients.json").write_text(
+        json.dumps(
+            {
+                "patients": [
+                    {"directory": "patient_training", "role": "training"},
+                    {"directory": "patient_refinement", "role": "refinement"},
+                ]
+            }
+        )
+    )
+
+    (x_tr, u_tr, y_tr), (x_te, u_te, y_te), label = load_csv_training_data(
+        tmp_path,
+        horizon=3,
+        patient_role="training",
+        test_fraction=0.25,
+    )
+
+    assert label.endswith(":training")
+    assert x_tr.shape[1] == 30
+    assert u_tr.shape[1] == 3
+    assert y_tr.shape[1] == 3
+    assert len(x_tr) + len(x_te) == 62
+    assert np.isclose(u_tr[0, 0], stim[15])
+    assert u_te.shape == y_te.shape
 
 
 def test_fit_ols_koopman_arx():

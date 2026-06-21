@@ -89,6 +89,68 @@ python scripts/run_koopman_mpc.py --model models/koopman_lasso46 --duration 60
 
 Models are saved under `models/` by the training script.
 
+## Using Your Own Data
+
+This repo does not include patient recordings, but the training script can read
+the same processed patient folders used by the DCNN repo:
+
+```text
+private_data/processed/aperiodic/
+├── patient_001/
+│   ├── beta_causal_RMS.csv
+│   ├── stimulation.csv
+│   └── metadata.json
+├── patient_002/
+│   └── ...
+└── selected_patients.json
+```
+
+In the 4YP workflow, those folders were produced from raw `.mat` files from the
+Cambium/MRC BNDU dataset [STN local field potential recordings from awake
+patients with Parkinson's, ON and OFF meds, and during 130 Hz
+DBS](https://data.mrc.ox.ac.uk/stn-lfp-on-off-and-dbs). Registered/logged-in
+users can download or request access to the raw data from that page. The
+medication-state `.mat` files contain a `SmrData` struct with `Fs`, `WvData`,
+and `WvTits`; the MATLAB processing selected the STN channel, extracted a
+causal 13-30 Hz beta RMS envelope, resampled to 50 Hz, and wrote
+`beta_causal_RMS.csv`. For resting-state recordings, `stimulation.csv` is the
+same length and contains zeros.
+
+Train from the processed root with:
+
+```bash
+python -m koopman_mpc.training.train_koopman_ols \
+  --data-dir ../private_data/processed/aperiodic \
+  --input-space linear \
+  --patient-role training \
+  --synthetic-stim \
+  --horizon 7 \
+  --model lasso46 \
+  --save-dir models/koopman_custom
+```
+
+`--synthetic-stim` overlays PRBS stimulation on autonomous/resting-state beta.
+Omit it if `stimulation.csv` already contains applied stimulation.
+`--input-space linear` is correct for the processed `beta_causal_RMS.csv`; use
+`--input-space log` only if your CSV has already been log-transformed.
+
+You can also point `--data-dir` at a single folder containing
+`beta_causal_RMS.csv` and `stimulation.csv`, such as the original
+`nndbs/original_js` stimulation pair. If the stimulation trace is sampled at an
+obvious integer multiple of the beta trace, the loader downsamples it before
+windowing.
+
+Cached `.npz` files with `x`, `u`, and `y` arrays are still supported as an
+optional private preprocessing format. The loader stacks all rows and holds out
+`--test-fraction` for test metrics. For proper patient/session-level
+validation, do the split in a private script and call `fit_ols_koopman(...)`
+directly.
+
+Runtime controller histories are newest-first; training windows are
+oldest-to-newest. The benchmark repo has a longer
+[DATA.md](https://github.com/joshampomah/closed-loop-dbs-bench/blob/master/DATA.md)
+covering the raw `.mat` processing route and replay format.
+
 ## Main Programming Interface
 
 Load a model and construct the controller:

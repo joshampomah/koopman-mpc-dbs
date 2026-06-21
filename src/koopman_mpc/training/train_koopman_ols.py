@@ -24,13 +24,17 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
 from koopman_mpc.models.koopman_model import MultiStepKoopman
-from koopman_mpc.synthetic.data_generator import generate_modulated_beta
+from koopman_mpc.synthetic.data_generator import (
+    _build_stim_matrices,
+    generate_modulated_beta,
+    generate_synthetic_stimulation,
+)
 
 
 # ── Sequence extraction ───────────────────────────────────────────────
@@ -54,37 +58,218 @@ def prepare_multistep_sequences(
     Returns:
         Dict with 'x' (N, 30), 'u' (N, horizon), 'y' (N, horizon).
     """
-    n_state = n_state_y + n_state_u
+    n_history = max(n_state_y, n_state_u)
     T = len(beta)
-    n_seq = T - n_state - horizon + 1
+    n_seq = T - n_history - horizon
     if n_seq <= 0:
-        raise ValueError(f"Signal too short ({T}) for n_state={n_state}, horizon={horizon}")
+        raise ValueError(
+            f"Signal too short ({T}) for history={n_history}, horizon={horizon}"
+        )
 
-    x_list, u_list, y_list = [], [], []
-    for i in range(n_seq):
-        # State: [y_past (oldest->newest), u_past (oldest->newest)]
-        y_past = beta[i: i + n_state_y]
-        u_past = stim[i: i + n_state_u]
-        x = np.concatenate([y_past, u_past])
+    x = np.empty((n_seq, n_state_y + n_state_u), dtype=np.float32)
+    u_fut = np.empty((n_seq, horizon), dtype=np.float32)
+    y_fut = np.empty((n_seq, horizon), dtype=np.float32)
 
-        # Future control (what was applied)
-        u_fut = stim[i + n_state: i + n_state + horizon]
-
-        # Future output (what we want to predict)
-        y_fut = beta[i + n_state: i + n_state + horizon]
-
-        x_list.append(x)
-        u_list.append(u_fut)
-        y_list.append(y_fut)
+    y_start = n_history - n_state_y + 1
+    u_start = n_history - n_state_u
+    for i in range(n_state_y):
+        x[:, i] = beta[y_start + i:y_start + i + n_seq]
+    for i in range(n_state_u):
+        x[:, n_state_y + i] = stim[u_start + i:u_start + i + n_seq]
+    for k in range(horizon):
+        u_fut[:, k] = stim[n_history + k:n_history + k + n_seq]
+        y_fut[:, k] = beta[n_history + k + 1:n_history + k + 1 + n_seq]
 
     return {
-        "x": np.array(x_list, dtype=np.float32),
-        "u": np.array(u_list, dtype=np.float32),
-        "y": np.array(y_list, dtype=np.float32),
+        "x": x,
+        "u": u_fut,
+        "y": y_fut,
     }
 
 
 # ── Data loading ──────────────────────────────────────────────────────
+
+def _read_csv_signal(path: Path) -> np.ndarray:
+    """Read a one-column CSV/text signal as float32."""
+    try:
+        arr = np.loadtxt(path, delimiter=",")
+    except ValueError:
+        arr = np.loadtxt(path)
+    return np.asarray(arr, dtype=np.float32).reshape(-1)
+
+
+def _align_beta_and_stim(beta: np.ndarray, stim: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Align beta and stimulation, downsampling obvious integer-rate mismatches."""
+    if len(beta) == len(stim):
+        return beta, stim
+
+    if len(stim) > len(beta):
+        ratio = round(len(stim) / len(beta))
+        if ratio > 1 and abs(len(stim) / len(beta) - ratio) < 0.05:
+            stim = stim[::ratio]
+    elif len(beta) > len(stim):
+        ratio = round(len(beta) / len(stim))
+        if ratio > 1 and abs(len(beta) / len(stim) - ratio) < 0.05:
+            beta = beta[::ratio]
+
+    n = min(len(beta), len(stim))
+    return beta[:n], stim[:n]
+
+
+def _patient_dirs(data_dir: Path, patient_role: str = "all") -> list[Path]:
+    """Find CSV patient folders, or treat data_dir itself as one folder."""
+    if (data_dir / "beta_causal_RMS.csv").exists() and (data_dir / "stimulation.csv").exists():
+        return [data_dir]
+
+    selected_path = data_dir / "selected_patients.json"
+    if selected_path.exists():
+        with open(selected_path) as f:
+            selected = json.load(f)
+        dirs = []
+        for item in selected.get("patients", []):
+            if patient_role != "all" and item.get("role") != patient_role:
+                continue
+            p = data_dir / item["directory"]
+            if (p / "beta_causal_RMS.csv").exists() and (p / "stimulation.csv").exists():
+                dirs.append(p)
+        if dirs:
+            return dirs
+
+    return sorted(
+        p for p in data_dir.glob("patient_*")
+        if (p / "beta_causal_RMS.csv").exists() and (p / "stimulation.csv").exists()
+    )
+
+
+def _apply_synthetic_stimulation(
+    beta_log: np.ndarray,
+    seed: int,
+    dt: float = 0.02,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Overlay synthetic PRBS stimulation on an autonomous log-beta trace."""
+    stim = generate_synthetic_stimulation(len(beta_log), seed=seed)
+    Ad, Bd, Cd = _build_stim_matrices(dt=dt)
+    x_eta = np.zeros(2, dtype=np.float64)
+    eta = np.empty(len(beta_log), dtype=np.float32)
+    for i, u_i in enumerate(stim):
+        eta[i] = float((Cd @ x_eta)[0])
+        x_eta = Ad @ x_eta + Bd.flatten() * float(u_i)
+    return (beta_log - eta).astype(np.float32), stim.astype(np.float32)
+
+
+def _split_arrays(
+    x_all: np.ndarray,
+    u_all: np.ndarray,
+    y_all: np.ndarray,
+    test_fraction: float,
+    label: str,
+) -> Tuple[Tuple, Tuple, str]:
+    """Chronologically split stacked arrays into train/test groups."""
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError(f"test_fraction must be in (0, 1), got {test_fraction}")
+    if len(x_all) < 2:
+        raise ValueError("Need at least two samples for train/test split")
+
+    split = int(round(len(x_all) * (1.0 - test_fraction)))
+    split = min(max(split, 1), len(x_all) - 1)
+    return (
+        (x_all[:split], u_all[:split], y_all[:split]),
+        (x_all[split:], u_all[split:], y_all[split:]),
+        label,
+    )
+
+
+def load_npz_training_data(
+    data_dir: Path,
+    test_fraction: float = 0.2,
+) -> Tuple[Tuple, Tuple, str]:
+    """Load pre-windowed training arrays from one or more `.npz` files.
+
+    Each file must contain `x`, `u`, and `y` arrays. `x` stores
+    [y_history, u_history] oldest-to-newest; `u` and `y` store future
+    control/output sequences.
+    """
+    npz_files = sorted(data_dir.glob("*.npz"))
+    if not npz_files:
+        raise FileNotFoundError(f"No .npz files found in {data_dir}")
+
+    xs, us, ys = [], [], []
+    for path in npz_files:
+        with np.load(path) as arrays:
+            missing = {"x", "u", "y"} - set(arrays.files)
+            if missing:
+                raise ValueError(f"{path} is missing required arrays: {sorted(missing)}")
+            x = np.asarray(arrays["x"], dtype=np.float32)
+            u = np.asarray(arrays["u"], dtype=np.float32)
+            y = np.asarray(arrays["y"], dtype=np.float32)
+
+        if x.ndim != 2 or u.ndim != 2 or y.ndim != 2:
+            raise ValueError(f"{path} arrays must all be 2-D")
+        if len(x) != len(u) or len(x) != len(y):
+            raise ValueError(f"{path} x/u/y arrays must have the same row count")
+        xs.append(x)
+        us.append(u)
+        ys.append(y)
+
+    x_all = np.vstack(xs)
+    u_all = np.vstack(us)
+    y_all = np.vstack(ys)
+    label = f"custom:{data_dir.name}"
+    return _split_arrays(x_all, u_all, y_all, test_fraction, label)
+
+
+def load_csv_training_data(
+    data_dir: Path,
+    horizon: int = 7,
+    input_space: str = "linear",
+    patient_role: str = "all",
+    synthetic_stim: bool = False,
+    max_samples_per_patient: Optional[int] = None,
+    test_fraction: float = 0.2,
+    seed: int = 42,
+    dt: float = 0.02,
+) -> Tuple[Tuple, Tuple, str]:
+    """Load Mark/4YP-style beta_causal_RMS.csv + stimulation.csv folders."""
+    dirs = _patient_dirs(data_dir, patient_role=patient_role)
+    if not dirs:
+        raise FileNotFoundError(
+            f"No patient CSV folders or .npz windows found in {data_dir}"
+        )
+
+    xs, us, ys = [], [], []
+    for idx, patient_dir in enumerate(dirs):
+        beta = _read_csv_signal(patient_dir / "beta_causal_RMS.csv")
+        stim = _read_csv_signal(patient_dir / "stimulation.csv")
+        beta, stim = _align_beta_and_stim(beta, stim)
+
+        if max_samples_per_patient is not None and len(beta) > max_samples_per_patient:
+            start = (len(beta) - max_samples_per_patient) // 2
+            beta = beta[start:start + max_samples_per_patient]
+            stim = stim[start:start + max_samples_per_patient]
+
+        if input_space == "linear":
+            beta = np.log(np.maximum(beta, 1e-10)).astype(np.float32)
+        elif input_space != "log":
+            raise ValueError(f"input_space must be 'linear' or 'log', got {input_space}")
+
+        if synthetic_stim:
+            beta, stim = _apply_synthetic_stimulation(
+                beta,
+                seed=seed + idx * 100000,
+                dt=dt,
+            )
+
+        seqs = prepare_multistep_sequences(beta, stim, horizon=horizon)
+        xs.append(seqs["x"])
+        us.append(seqs["u"])
+        ys.append(seqs["y"])
+
+    x_all = np.vstack(xs)
+    u_all = np.vstack(us)
+    y_all = np.vstack(ys)
+    label = f"csv:{data_dir.name}:{patient_role}"
+    return _split_arrays(x_all, u_all, y_all, test_fraction, label)
+
 
 def load_training_data(
     horizon: int = 7,
@@ -93,14 +278,35 @@ def load_training_data(
     train_duration: float = 3600.0,  # 1 hour of synthetic data
     test_duration: float = 600.0,    # 10 min test
     dt: float = 0.02,
+    data_dir: Optional[Path] = None,
+    test_fraction: float = 0.2,
+    input_space: str = "linear",
+    patient_role: str = "all",
+    synthetic_stim: bool = False,
+    max_samples_per_patient: Optional[int] = None,
 ) -> Tuple[Tuple, Tuple, str]:
-    """Generate synthetic training and test data.
+    """Load custom data or generate synthetic training/test data.
 
     Uses the AR + PRBS stimulation model from the bench repo.
 
     Returns:
-        (x_train, u_train, y_train), (x_test, u_test, y_test), "synthetic"
+        (x_train, u_train, y_train), (x_test, u_test, y_test), dataset label
     """
+    if data_dir is not None:
+        if any(data_dir.glob("*.npz")):
+            return load_npz_training_data(data_dir, test_fraction=test_fraction)
+        return load_csv_training_data(
+            data_dir=data_dir,
+            horizon=horizon,
+            input_space=input_space,
+            patient_role=patient_role,
+            synthetic_stim=synthetic_stim,
+            max_samples_per_patient=max_samples_per_patient,
+            test_fraction=test_fraction,
+            seed=modulation_seed,
+            dt=dt,
+        )
+
     n_train = int(round(train_duration / dt))
     n_test = int(round(test_duration / dt))
 
@@ -319,6 +525,40 @@ def main() -> None:
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--data-dir", type=Path, default=None,
+        help=(
+            "Processed patient root/folder with beta_causal_RMS.csv and "
+            "stimulation.csv, or directory of cached .npz x/u/y windows"
+        ),
+    )
+    parser.add_argument(
+        "--test-fraction", type=float, default=0.2,
+        help="Fraction of custom rows held out for testing",
+    )
+    parser.add_argument(
+        "--input-space",
+        choices=["linear", "log"],
+        default="linear",
+        help="Space used by beta_causal_RMS.csv values before training conversion.",
+    )
+    parser.add_argument(
+        "--patient-role",
+        choices=["all", "training", "refinement"],
+        default="all",
+        help="Role filter when data-dir contains selected_patients.json.",
+    )
+    parser.add_argument(
+        "--synthetic-stim",
+        action="store_true",
+        help="Overlay synthetic PRBS stimulation on resting-state/autonomous beta.",
+    )
+    parser.add_argument(
+        "--max-samples-per-patient",
+        type=int,
+        default=None,
+        help="Optional centered crop length per patient folder before windowing.",
+    )
+    parser.add_argument(
         "--train-duration", type=float, default=3600.0,
         help="Synthetic training data duration in seconds (default: 3600)",
     )
@@ -326,12 +566,21 @@ def main() -> None:
 
     models_to_train = ["lasso46", "arx"] if args.model == "both" else [args.model]
 
-    print(f"Generating synthetic data (horizon={args.horizon}, n_aug={args.n_augmentations})...")
+    if args.data_dir is not None:
+        print(f"Loading custom data from {args.data_dir} (horizon={args.horizon})...")
+    else:
+        print(f"Generating synthetic data (horizon={args.horizon}, n_aug={args.n_augmentations})...")
     (x_tr, u_tr, y_tr), (x_te, u_te, y_te), patient = load_training_data(
         horizon=args.horizon,
         n_augmentations=args.n_augmentations,
         modulation_seed=args.seed,
         train_duration=args.train_duration,
+        data_dir=args.data_dir,
+        test_fraction=args.test_fraction,
+        input_space=args.input_space,
+        patient_role=args.patient_role,
+        synthetic_stim=args.synthetic_stim,
+        max_samples_per_patient=args.max_samples_per_patient,
     )
     print(f"  Train: {x_tr.shape[0]} samples, Test: {x_te.shape[0]} samples")
 
