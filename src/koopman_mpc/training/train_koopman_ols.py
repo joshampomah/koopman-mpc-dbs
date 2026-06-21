@@ -233,7 +233,7 @@ def load_csv_training_data(
     dirs = _patient_dirs(data_dir, patient_role=patient_role)
     if not dirs:
         raise FileNotFoundError(
-            f"No patient CSV folders or .npz windows found in {data_dir}"
+            f"No processed patient CSV folders found in {data_dir}"
         )
 
     xs, us, ys = [], [], []
@@ -528,7 +528,7 @@ def main() -> None:
         "--data-dir", type=Path, default=None,
         help=(
             "Processed patient root/folder with beta_causal_RMS.csv and "
-            "stimulation.csv, or directory of cached .npz x/u/y windows"
+            "stimulation.csv"
         ),
     )
     parser.add_argument(

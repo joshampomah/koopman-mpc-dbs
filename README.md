@@ -138,8 +138,7 @@ You can also point `--data-dir` at a single folder containing
 `beta_causal_RMS.csv` and `stimulation.csv`, rather than a root containing
 many `patient_*` folders.
 
-Cached `.npz` files with `x`, `u`, and `y` arrays are still supported as an
-optional private preprocessing format. The loader stacks all rows and holds out
+The loader stacks all selected patient-folder rows and holds out
 `--test-fraction` for test metrics. For proper patient/session-level
 validation, do the split in a private script and call `fit_ols_koopman(...)`
 directly.
